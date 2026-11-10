@@ -4,6 +4,8 @@ An AI assistant that books real appointments over **WhatsApp**, built on the **o
 
 *(¿Español? Abajo hay un resumen en español.)*
 
+![Demo: the agent lists services and books an appointment](docs/demo.jpg)
+
 ```
 Customer on WhatsApp ──▶ Meta Cloud API ──▶ POST /webhook ──▶ AI agent ──▶ tools ──▶ SQLite
                                  ◀── send message ◀── reply ◀──┘
