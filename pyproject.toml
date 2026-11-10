@@ -1,0 +1,18 @@
+[project]
+name = "whatsapp-ai-agent"
+version = "0.1.0"
+description = "AI appointment-booking agent connected to the official WhatsApp Cloud API"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic",
+    "fastapi",
+    "google-genai>=1.0",
+    "httpx",
+    "python-dotenv>=1.0",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
