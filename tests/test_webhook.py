@@ -50,6 +50,15 @@ def test_forged_signature_is_rejected(client):
     assert r.status_code == 403
 
 
+def test_webhook_is_rejected_when_secret_is_missing(client, monkeypatch):
+    monkeypatch.delenv("WHATSAPP_APP_SECRET", raising=False)
+    body = json.dumps(incoming()).encode()
+    r = client.post("/webhook", content=body, headers={
+        "X-Hub-Signature-256": sign(body), "Content-Type": "application/json",
+    })
+    assert r.status_code == 403
+
+
 def test_valid_message_is_processed_once(client, monkeypatch):
     calls = []
     monkeypatch.setattr(main, "_process", lambda phone, text, mid: calls.append((phone, text)))

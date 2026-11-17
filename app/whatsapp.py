@@ -39,9 +39,8 @@ def valid_signature(body: bytes, header: str | None) -> bool:
     """Check Meta's X-Hub-Signature-256 header against the app secret."""
     secret = os.environ.get("WHATSAPP_APP_SECRET", "")
     if not secret:
-        # Without a secret we can't verify; allow it but say so loudly.
-        log.warning("WHATSAPP_APP_SECRET not set: skipping signature verification")
-        return True
+        log.error("WHATSAPP_APP_SECRET not set: rejecting webhook")
+        return False
     if not header or not header.startswith("sha256="):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()

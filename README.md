@@ -11,16 +11,18 @@ Customer on WhatsApp ──▶ Meta Cloud API ──▶ POST /webhook ──▶ 
                                  ◀── send message ◀── reply ◀──┘
 ```
 
-## Why this is production-grade, not a tutorial bot
+## Features and current limits
 
 - **Webhook signature verification.** Every incoming webhook is checked with HMAC-SHA256 against the Meta app secret, so nobody can fake customer messages by POSTing to the endpoint.
-- **Deduplication.** Meta re-sends webhooks when the ACK is slow; message ids are remembered so a customer never gets answered twice.
+- **Deduplication.** Recent message IDs are kept in memory for 10 minutes to reduce duplicate replies. This does not survive restarts or coordinate multiple workers.
 - **Fast ACK.** The webhook returns 200 immediately and the AI runs in a background task — slow webhooks get retried and eventually disabled by Meta.
 - **No double-booking, guaranteed by the database.** A partial unique index allows only one *active* appointment per slot. Tested with 20 concurrent requests for the same slot: exactly one wins.
-- **Prompt-injection safe by design.** The customer's phone number is injected by the system on every tool call. Even if the model is manipulated, it cannot read or cancel another customer's appointments (there's a test for that too).
+- **Customer isolation.** The customer's phone number is injected by the system on each tool call to restrict access to that customer's appointments. This is not a guarantee against every prompt-injection attack.
 - **Business rules live in code, not in the prompt.** The model cannot invent prices, book on Sundays or at 10:15 — the tools refuse.
 - **Customers never see technical errors.** Any failure rolls the conversation back and answers with a friendly message; details go to a rotating log.
-- **20 automated tests** (pytest), including the agent loop against a scripted fake model — they run with no API key and no network.
+- **Automated tests** (pytest), including the agent loop against a scripted fake model — they run with no API key and no network.
+
+This is a portfolio demo, not a production deployment. Background tasks and conversation history are in memory; a restart can lose pending work. The local simulator has no authentication and must not be exposed publicly. A real deployment needs durable message processing, access controls, monitoring, and a review of data protection and Meta configuration.
 
 ## Run it in 2 minutes (no Meta account needed)
 
@@ -59,11 +61,11 @@ uv run pytest
 | `app/agent.py` | The agentic loop (Claude + tools, friendly error handling) |
 | `app/tools.py` | Business rules: availability, booking, cancellation |
 | `app/db.py` | SQLite schema; the unique index that prevents double-booking |
-| `tests/` | 20 tests: concurrency, security, webhook, agent loop |
+| `tests/` | Tests for concurrency, security, webhook, and agent loop |
 
 ## Resumen en español
 
-Asistente de IA que agenda citas reales por WhatsApp usando la **API oficial de Meta** (WhatsApp Cloud API). Incluye verificación de firmas de los webhooks, deduplicación de mensajes, imposibilidad de doble-agendamiento (garantizada por la base de datos y probada con 20 solicitudes simultáneas), defensa contra prompt injection y un **simulador local** para probarlo sin cuenta de Meta. Las reglas de negocio viven en el código, no en el prompt: la IA no puede inventar precios ni horarios.
+Asistente de demostración que agenda citas por WhatsApp mediante la **API oficial de Meta**. Verifica las firmas de los webhooks y evita reservas simultáneas del mismo horario mediante la base de datos. La deduplicación y el historial de conversación viven en memoria y se pierden al reiniciar. El simulador local no tiene autenticación y no debe exponerse a internet. Antes de usarlo con clientes reales hacen falta procesamiento persistente, controles de acceso y monitoreo.
 
 ---
 
