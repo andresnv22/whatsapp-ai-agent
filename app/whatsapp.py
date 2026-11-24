@@ -13,13 +13,15 @@ import hashlib
 import hmac
 import logging
 import os
-import time
 
 import httpx
+
+from . import db
 
 log = logging.getLogger("whatsapp-bot")
 
 GRAPH_VERSION = "v21.0"
+MAX_WHATSAPP_CHARS = 4096
 
 
 def _token() -> str:
@@ -47,24 +49,33 @@ def valid_signature(body: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected, header.removeprefix("sha256="))
 
 
-# Recently seen message ids (Meta retries webhooks): id -> first-seen time.
+# Kept for backwards compatibility in tests; persistence lives in SQLite.
 _seen: dict[str, float] = {}
 SEEN_TTL = 10 * 60
 
 
 def is_duplicate(message_id: str) -> bool:
-    now = time.time()
-    for mid, t in list(_seen.items()):  # drop old entries
-        if now - t > SEEN_TTL:
-            del _seen[mid]
-    if message_id in _seen:
-        return True
-    _seen[message_id] = now
-    return False
+    return db.claim_message(message_id, SEEN_TTL)
+
+
+def _extract_text(msg: dict) -> str:
+    msg_type = msg.get("type")
+    if msg_type == "text":
+        return msg.get("text", {}).get("body", "")
+    if msg_type == "interactive":
+        inter = msg.get("interactive", {})
+        itype = inter.get("type")
+        if itype == "button_reply":
+            return inter.get("button_reply", {}).get("title", "")
+        if itype == "list_reply":
+            return inter.get("list_reply", {}).get("title", "")
+    if msg_type == "button":
+        return msg.get("button", {}).get("text", "")
+    return ""
 
 
 def parse_incoming(payload: dict) -> list[dict]:
-    """Extract text messages from a webhook payload.
+    """Extract text and interactive reply messages from a webhook payload.
 
     Meta also sends status updates (sent/delivered/read) through the same
     webhook; those have no "messages" key and are ignored here.
@@ -73,39 +84,82 @@ def parse_incoming(payload: dict) -> list[dict]:
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             for msg in change.get("value", {}).get("messages", []):
-                if msg.get("type") != "text":
-                    continue  # voice notes, images, etc. — out of scope for now
+                text = _extract_text(msg)
+                if not text:
+                    continue
                 out.append({
                     "id": msg.get("id", ""),
                     "phone": msg.get("from", ""),
-                    "text": msg.get("text", {}).get("body", ""),
+                    "text": text,
                 })
     return out
 
 
+def parse_unsupported(payload: dict) -> list[dict]:
+    """Extract non-text messages (voice notes, images, etc.) so the bot can reply politely."""
+    out = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            for msg in change.get("value", {}).get("messages", []):
+                if _extract_text(msg):
+                    continue
+                msg_type = msg.get("type", "unknown")
+                if msg_type in {"text", "interactive", "button"}:
+                    continue
+                out.append({
+                    "id": msg.get("id", ""),
+                    "phone": msg.get("from", ""),
+                    "type": msg_type,
+                })
+    return out
+
+
+def chunk_text(text: str, limit: int = MAX_WHATSAPP_CHARS) -> list[str]:
+    """Split long replies on paragraph/line/space boundaries under WhatsApp's 4096-char cap."""
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return [c for c in chunks if c]
+
+
 def send_text(phone: str, text: str) -> bool:
-    """Send a WhatsApp message. Returns False on failure (and logs it);
-    a send error must never crash the webhook."""
+    """Send a WhatsApp message (chunked if >4096 chars). Returns False on failure."""
     url = f"https://graph.facebook.com/{GRAPH_VERSION}/{_phone_number_id()}/messages"
-    try:
-        r = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {_token()}"},
-            json={
-                "messaging_product": "whatsapp",
-                "to": phone,
-                "type": "text",
-                "text": {"body": text[:4096]},
-            },
-            timeout=15,
-        )
-        if r.status_code >= 400:
-            log.error("WhatsApp send failed (%s): %s", r.status_code, r.text[:500])
-            return False
+    chunks = chunk_text(text)
+    if not chunks:
         return True
-    except httpx.HTTPError as e:
-        log.error("WhatsApp send failed: %s", e)
-        return False
+    for part in chunks:
+        try:
+            r = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {_token()}"},
+                json={
+                    "messaging_product": "whatsapp",
+                    "to": phone,
+                    "type": "text",
+                    "text": {"body": part},
+                },
+                timeout=15,
+            )
+            if r.status_code >= 400:
+                log.error("WhatsApp send failed (%s): %s", r.status_code, r.text[:500])
+                return False
+        except httpx.HTTPError as e:
+            log.error("WhatsApp send failed: %s", e)
+            return False
+    return True
 
 
 def mark_read(message_id: str) -> None:

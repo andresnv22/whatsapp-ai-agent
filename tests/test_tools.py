@@ -93,3 +93,10 @@ def test_unknown_service_and_bad_dates_return_errors():
     assert "error" in tools.book_appointment("Nope", f"{future_weekday()}T10:00", "Ana", phone="1")
     assert "error" in tools.book_appointment("Classic haircut", "not-a-date", "Ana", phone="1")
     assert "error" in tools.check_availability("not-a-date")
+
+
+def test_shop_timezone_env_is_respected(monkeypatch):
+    monkeypatch.setenv("SHOP_TIMEZONE", "America/Bogota")
+    assert db.shop_timezone().key == "America/Bogota"
+    monkeypatch.setenv("SHOP_TIMEZONE", "Invalid/Zone")
+    assert db.shop_timezone().key == db.DEFAULT_TIMEZONE

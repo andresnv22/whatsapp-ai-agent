@@ -24,15 +24,18 @@ log = logging.getLogger("whatsapp-bot")
 PROVIDER = os.environ.get("PROVIDER", "claude").lower()
 MODEL = os.environ.get("MODEL", "claude-opus-5-5")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-# If a Gemini model is overloaded, the next one in the list is tried
-GEMINI_MODELS = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash"]))
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+# If the primary Gemini model is overloaded or out of quota, try the fallback model
+GEMINI_MODELS = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
 MAX_STEPS = 10          # safety cap so the loop can't run forever
+MAX_HISTORY = 24        # max messages kept per customer (trimmed at clean user boundaries)
 IDLE_RESET = 6 * 60 * 60  # seconds of silence before a fresh conversation
 MAX_MESSAGE_LEN = 2000
 
 FAIL_MSG = "Sorry, I hit a technical problem 🙏 Could you send that again in a minute?"
 REFUSED_MSG = "Sorry, I can't help with that. Shall I book you an appointment?"
 CONFUSED_MSG = "Sorry, I got confused. Could you say that another way?"
+UNSUPPORTED_MSG = "Sorry, I can only read text messages for now 🙏 Please type your request (or reply in Spanish/English)."
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 SYSTEM = """You are Max, the virtual assistant of Fade Factory, a barbershop. You chat on WhatsApp.
@@ -72,8 +75,18 @@ def _lock(phone: str) -> threading.Lock:
         return _locks.setdefault(phone, threading.Lock())
 
 
+def _active_provider() -> str:
+    return os.environ.get("PROVIDER", PROVIDER).lower()
+
+
+def _gemini_models() -> list[str]:
+    primary = os.environ.get("GEMINI_MODEL", GEMINI_MODEL).strip()
+    fallback = os.environ.get("GEMINI_FALLBACK_MODEL", GEMINI_FALLBACK_MODEL).strip()
+    return list(dict.fromkeys([m for m in (primary, fallback) if m]))
+
+
 def missing_key() -> str | None:
-    variable = "GEMINI_API_KEY" if PROVIDER == "gemini" else "ANTHROPIC_API_KEY"
+    variable = "GEMINI_API_KEY" if _active_provider() == "gemini" else "ANTHROPIC_API_KEY"
     value = os.environ.get(variable, "")
     return variable if not value or value.startswith("paste-your") else None
 
@@ -81,6 +94,61 @@ def missing_key() -> str | None:
 def _system() -> str:
     t = db.now()
     return f"{SYSTEM}\n\nToday is {DAYS[t.weekday()]} {t.date().isoformat()}, the time is {t:%H:%M}."
+
+
+def _serialize_block(block) -> dict:
+    if isinstance(block, dict):
+        return block
+    if hasattr(block, "model_dump"):
+        return block.model_dump(mode="json", exclude_none=True)
+    return dict(vars(block))
+
+
+def _serialize_messages(messages: list, provider: str) -> list[dict]:
+    out = []
+    for m in messages:
+        if provider == "gemini":
+            out.append(m.model_dump(mode="json", exclude_none=True) if hasattr(m, "model_dump") else m)
+        else:
+            content = m["content"]
+            if isinstance(content, list):
+                content = [_serialize_block(b) for b in content]
+            out.append({"role": m["role"], "content": content})
+    return out
+
+
+def _deserialize_messages(raw: list[dict], provider: str) -> list:
+    if provider != "gemini" or not raw:
+        return raw
+    from google.genai import types
+
+    return [types.Content.model_validate(m) if isinstance(m, dict) else m for m in raw]
+
+
+def _is_plain_user_turn(msg, provider: str) -> bool:
+    if provider == "gemini":
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        parts = msg.get("parts", []) if isinstance(msg, dict) else (getattr(msg, "parts", None) or [])
+        has_fn_resp = any(
+            (p.get("function_response") if isinstance(p, dict) else getattr(p, "function_response", None))
+            for p in parts
+        )
+        return role == "user" and not has_fn_resp
+    return isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str)
+
+
+def _trim_history(messages: list, provider: str) -> list:
+    if len(messages) <= MAX_HISTORY:
+        return messages
+    cut = len(messages) - MAX_HISTORY
+    while cut < len(messages) and not _is_plain_user_turn(messages[cut], provider):
+        cut += 1
+    return messages[cut:]
+
+
+def reset_conversation(phone: str) -> None:
+    conversations.pop(phone, None)
+    db.delete_conversation(phone)
 
 
 def run_tool(name: str, args: dict, phone: str) -> tuple[dict, bool]:
@@ -120,16 +188,22 @@ def reply(phone: str, text: str) -> dict:
     if not text:
         return {"reply": "Hi! How can I help you? 😊", "actions": []}
 
+    provider = _active_provider()
     with _lock(phone):
         conv = conversations.get(phone)
-        if conv is None or time.time() - conv["last"] > IDLE_RESET:
-            conv = conversations[phone] = {"messages": [], "last": time.time()}
+        if conv is None or conv.get("provider") != provider or time.time() - conv["last"] > IDLE_RESET:
+            persisted = db.load_conversation(phone, provider, IDLE_RESET)
+            conv = conversations[phone] = {
+                "provider": provider,
+                "messages": _deserialize_messages(persisted, provider),
+                "last": time.time(),
+            }
         messages = conv["messages"]
         before = len(messages)  # to undo this turn if something fails
         actions: list = []
 
         try:
-            reply_with = _gemini_reply if PROVIDER == "gemini" else _claude_reply
+            reply_with = _gemini_reply if provider == "gemini" else _claude_reply
             answer = reply_with(text, messages, actions, phone)
         except Refused:
             del messages[before:]
@@ -143,6 +217,10 @@ def reply(phone: str, text: str) -> dict:
         if answer is None:  # ran out of steps
             del messages[before:]
             return {"reply": CONFUSED_MSG, "actions": actions}
+
+        trimmed = _trim_history(messages, provider)
+        conv["messages"] = trimmed
+        db.save_conversation(phone, provider, _serialize_messages(trimmed, provider))
         return {"reply": _final_text(answer, actions), "actions": actions}
 
 
@@ -163,8 +241,8 @@ def _claude_reply(text: str, messages: list, actions: list, phone: str) -> str |
         )
         if response.stop_reason == "refusal":
             raise Refused()
-        # Keep the full response (not just the text) so the context stays valid
-        messages.append({"role": "assistant", "content": response.content})
+        # Keep serialized blocks so history persists cleanly in SQLite
+        messages.append({"role": "assistant", "content": [_serialize_block(b) for b in response.content]})
 
         if response.stop_reason != "tool_use":
             return "".join(b.text for b in response.content if b.type == "text")
@@ -197,23 +275,27 @@ def _gemini_generate(messages, config):
     import httpx
     from google.genai import errors, types
 
-    def with_time(seconds: int, attempts: int):
-        return config.model_copy(update={"http_options": types.HttpOptions(
-            timeout=seconds * 1000, retry_options=types.HttpRetryOptions(attempts=attempts),
-        )})
+    def for_model(model: str, seconds: int, attempts: int):
+        updates = {
+            "http_options": types.HttpOptions(
+                timeout=seconds * 1000,
+                retry_options=types.HttpRetryOptions(attempts=attempts),
+            )
+        }
+        # thinking_level applies to Gemini 3+; omit on 2.5 fallback models
+        if "gemini-3" in model:
+            updates["thinking_config"] = types.ThinkingConfig(thinking_level="low")
+        return config.model_copy(update=updates)
 
-    # The first models get little time and no retries: if they're overloaded,
-    # moving on quickly beats keeping the customer waiting.
-    impatient, patient = with_time(15, 1), with_time(40, 2)
-    available = [m for m in GEMINI_MODELS if time.time() >= _down_until.get(m, 0)]
-    available = available or GEMINI_MODELS[-1:]  # all down: still try the last one
+    models = _gemini_models()
+    available = [m for m in models if time.time() >= _down_until.get(m, 0)]
+    available = available or models[-1:]  # all down: still try the last one
 
     for i, model in enumerate(available):
         last = i == len(available) - 1
+        cfg = for_model(model, 40, 2) if last else for_model(model, 15, 1)
         try:
-            return _gemini.models.generate_content(
-                model=model, contents=messages, config=patient if last else impatient
-            )
+            return _gemini.models.generate_content(model=model, contents=messages, config=cfg)
         except (errors.ServerError, errors.ClientError, httpx.TimeoutException) as e:
             # 5xx or timeout = overloaded; 429 = that model's quota ran out
             if isinstance(e, errors.ClientError) and e.code != 429:
@@ -243,7 +325,6 @@ def _gemini_reply(text: str, messages: list, actions: list, phone: str) -> str |
         ])],
         # We run the loop ourselves, same as with Claude
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        thinking_config=types.ThinkingConfig(thinking_level="low"),  # simple chat: fast
     )
 
     messages.append(types.Content(role="user", parts=[types.Part.from_text(text=text)]))

@@ -103,3 +103,77 @@ def test_empty_message_gets_a_greeting_without_calling_the_model():
     agent._client = FakeClaude([])  # any model call would crash (empty script)
     out = agent.reply("111", "   ")
     assert "Hi" in out["reply"]
+
+
+def test_conversation_persists_in_sqlite_across_restarts():
+    agent._client = FakeClaude([text_response("Hi Ana!")])
+    assert agent.reply("111", "Hello")["reply"] == "Hi Ana!"
+
+    # Simulate server restart (in-memory dict wiped)
+    agent.conversations.clear()
+    seen_histories = []
+
+    class InspectingClaude(FakeClaude):
+        def _create(self, **kwargs):
+            seen_histories.append(list(kwargs["messages"]))
+            return super()._create(**kwargs)
+
+    agent._client = InspectingClaude([text_response("Sure!")])
+    assert agent.reply("111", "What time?")["reply"] == "Sure!"
+    # Previous turn (user + assistant) was loaded from SQLite before the new user turn
+    assert len(seen_histories[0]) == 3
+    assert seen_histories[0][0]["content"] == "Hello"
+
+
+def test_history_trimming_keeps_tool_pairs_intact(monkeypatch):
+    monkeypatch.setattr(agent, "MAX_HISTORY", 4)
+    msgs = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "list_services", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "{}"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "services"}]},
+        {"role": "user", "content": "turn 2"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+    trimmed = agent._trim_history(msgs, "claude")
+    assert trimmed[0] == {"role": "user", "content": "turn 2"}
+
+
+def test_gemini_reply_loop_and_model_fallback(monkeypatch):
+    from google.genai import errors, types
+
+    monkeypatch.setenv("PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.5-flash")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+    agent._down_until.clear()
+
+    called_models = []
+
+    def fake_generate(model, contents, config):
+        called_models.append(model)
+        if model == "gemini-3.5-flash":
+            raise errors.ServerError(503, {"error": {"message": "overloaded"}}, None)
+        if len(called_models) == 2:
+            # Tool call on fallback model
+            return SimpleNamespace(
+                candidates=[SimpleNamespace(content=types.Content(
+                    role="model",
+                    parts=[types.Part.from_function_call(name="list_services", args={})],
+                ))],
+                function_calls=[SimpleNamespace(name="list_services", args={})],
+            )
+        return SimpleNamespace(
+            candidates=[SimpleNamespace(content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text="**Classic haircut** is $15")],
+            ))],
+            function_calls=[],
+        )
+
+    monkeypatch.setattr(agent, "_gemini", SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate)))
+    out = agent.reply("555", "prices?")
+    assert out["reply"] == "*Classic haircut* is $15"
+    assert called_models == ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash"]
+    assert out["actions"] == [{"tool": "list_services", "input": {}, "error": False}]
+    agent._gemini = None
+    agent._down_until.clear()

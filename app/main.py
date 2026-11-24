@@ -13,14 +13,14 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
 from . import db, whatsapp  # noqa: E402
-from .agent import conversations, missing_key, reply  # noqa: E402
+from .agent import UNSUPPORTED_MSG, missing_key, reply, reset_conversation  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "static"
@@ -61,6 +61,13 @@ def _process(phone: str, text: str, message_id: str) -> None:
     whatsapp.send_text(phone, answer["reply"])
 
 
+def _reply_unsupported(phone: str, message_id: str, msg_type: str) -> None:
+    """Politely inform customers who send voice notes, images, etc."""
+    log.info("Unsupported %s message from %s", msg_type, phone)
+    whatsapp.mark_read(message_id)
+    whatsapp.send_text(phone, UNSUPPORTED_MSG)
+
+
 @app.post("/webhook")
 async def receive_webhook(request: Request, background: BackgroundTasks):
     body = await request.body()
@@ -72,6 +79,10 @@ async def receive_webhook(request: Request, background: BackgroundTasks):
         if not msg["phone"] or whatsapp.is_duplicate(msg["id"]):
             continue
         background.add_task(_process, msg["phone"], msg["text"], msg["id"])
+    for msg in whatsapp.parse_unsupported(payload):
+        if not msg["phone"] or whatsapp.is_duplicate(msg["id"]):
+            continue
+        background.add_task(_reply_unsupported, msg["phone"], msg["id"], msg["type"])
     # Always 200, fast: Meta retries (and eventually disables) slow webhooks.
     return {"status": "ok"}
 
@@ -98,8 +109,25 @@ def sim_chat(msg: SimMessage):
 
 @app.post("/sim/reset/{phone}")
 def sim_reset(phone: str):
-    conversations.pop(phone, None)
+    reset_conversation(phone)
     return {"ok": True}
+
+
+@app.get("/sim/appointments")
+def sim_appointments():
+    """Live schedule for the local simulator panel."""
+    return db.list_appointments()
+
+
+@app.get("/appointments")
+def admin_appointments(authorization: str | None = Header(default=None)):
+    """Protected schedule endpoint for deployments (requires ADMIN_TOKEN)."""
+    expected = os.environ.get("ADMIN_TOKEN", "")
+    if not expected:
+        raise HTTPException(503, "ADMIN_TOKEN not configured")
+    if authorization != f"Bearer {expected}":
+        raise HTTPException(401, "Unauthorized")
+    return db.list_appointments()
 
 
 @app.get("/health")
