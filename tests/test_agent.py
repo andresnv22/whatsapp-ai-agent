@@ -38,6 +38,7 @@ def tool_response(name, args):
 @pytest.fixture(autouse=True)
 def clean(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setenv("PROVIDER", "claude")
     db.init()
     agent.conversations.clear()
     agent._client = None
@@ -143,15 +144,15 @@ def test_gemini_reply_loop_and_model_fallback(monkeypatch):
     from google.genai import errors, types
 
     monkeypatch.setenv("PROVIDER", "gemini")
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.5-flash")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
     agent._down_until.clear()
 
     called_models = []
 
     def fake_generate(model, contents, config):
         called_models.append(model)
-        if model == "gemini-3.5-flash":
+        if model == "gemini-3.8-flash":
             raise errors.ServerError(503, {"error": {"message": "overloaded"}}, None)
         if len(called_models) == 2:
             # Tool call on fallback model
@@ -173,7 +174,7 @@ def test_gemini_reply_loop_and_model_fallback(monkeypatch):
     monkeypatch.setattr(agent, "_gemini", SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate)))
     out = agent.reply("555", "prices?")
     assert out["reply"] == "*Classic haircut* is $15"
-    assert called_models == ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.5-flash"]
+    assert called_models == ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.5-flash"]
     assert out["actions"] == [{"tool": "list_services", "input": {}, "error": False}]
     agent._gemini = None
     agent._down_until.clear()

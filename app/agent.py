@@ -23,8 +23,8 @@ log = logging.getLogger("whatsapp-bot")
 
 PROVIDER = os.environ.get("PROVIDER", "claude").lower()
 MODEL = os.environ.get("MODEL", "claude-opus-5-5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
-GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
 # If the primary Gemini model is overloaded or out of quota, try the fallback model
 GEMINI_MODELS = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
 MAX_STEPS = 10          # safety cap so the loop can't run forever
@@ -297,8 +297,8 @@ def _gemini_generate(messages, config):
         try:
             return _gemini.models.generate_content(model=model, contents=messages, config=cfg)
         except (errors.ServerError, errors.ClientError, httpx.TimeoutException) as e:
-            # 5xx or timeout = overloaded; 429 = that model's quota ran out
-            if isinstance(e, errors.ClientError) and e.code != 429:
+            # 5xx or timeout = overloaded; 429 = quota exhausted; 404 = deprecated/unknown model
+            if isinstance(e, errors.ClientError) and e.code not in (404, 429):
                 raise
             log.warning("Gemini %s unavailable (%s), trying the next one", model, e)
             _down_until[model] = time.time() + RETRY_AFTER
