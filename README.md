@@ -1,6 +1,6 @@
 # WhatsApp AI Agent
 
-An AI assistant that books real appointments over **WhatsApp**, built on the **official WhatsApp Cloud API** (Meta). Works with **Claude or Gemini** (pick with `PROVIDER` in `.env`; the Gemini path falls back to a second model when one is overloaded). The demo business is a barbershop, but the WhatsApp layer works for any business logic you plug into it.
+An AI assistant that books real appointments over **WhatsApp**, built on the **official WhatsApp Cloud API** (Meta). Works with **DeepSeek, Claude or Gemini** (pick with `PROVIDER` in `.env`; DeepSeek is the default for production). The demo business is a barbershop, but the WhatsApp layer works for any business logic you plug into it.
 
 *(¿Español? Abajo hay un resumen en español.)*
 

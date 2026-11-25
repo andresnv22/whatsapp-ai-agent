@@ -27,6 +27,8 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
 # If the primary Gemini model is overloaded or out of quota, try the fallback model
 GEMINI_MODELS = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash").strip() or "deepseek-flash"
+DEEPSEEK_BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 MAX_STEPS = 10          # safety cap so the loop can't run forever
 MAX_HISTORY = 24        # max messages kept per customer (trimmed at clean user boundaries)
 IDLE_RESET = 6 * 60 * 60  # seconds of silence before a fresh conversation
@@ -86,7 +88,13 @@ def _gemini_models() -> list[str]:
 
 
 def missing_key() -> str | None:
-    variable = "GEMINI_API_KEY" if _active_provider() == "gemini" else "ANTHROPIC_API_KEY"
+    provider = _active_provider()
+    if provider == "deepseek":
+        variable = "DEEPSEEK_API_KEY"
+    elif provider == "gemini":
+        variable = "GEMINI_API_KEY"
+    else:
+        variable = "ANTHROPIC_API_KEY"
     value = os.environ.get(variable, "")
     return variable if not value or value.startswith("paste-your") else None
 
@@ -203,7 +211,12 @@ def reply(phone: str, text: str) -> dict:
         actions: list = []
 
         try:
-            reply_with = _gemini_reply if provider == "gemini" else _claude_reply
+            if provider == "deepseek":
+                reply_with = _deepseek_reply
+            elif provider == "gemini":
+                reply_with = _gemini_reply
+            else:
+                reply_with = _claude_reply
             answer = reply_with(text, messages, actions, phone)
         except Refused:
             del messages[before:]
@@ -262,6 +275,101 @@ def _claude_reply(text: str, messages: list, actions: list, phone: str) -> str |
         messages.append({"role": "user", "content": results})
     return None
 
+
+
+# ---------- DeepSeek (OpenAI-compatible) ----------
+
+def _historial_texto(messages: list) -> list[dict]:
+    out = []
+    for m in messages:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role == "model":
+            role = "assistant"
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            chunks = []
+            for block in content:
+                if isinstance(block, str):
+                    chunks.append(block)
+                elif isinstance(block, dict) and block.get("type") == "text":
+                    chunks.append(block.get("text", ""))
+            text = "".join(chunks)
+        if role in ("user", "assistant") and text.strip():
+            out.append({"role": role, "content": text.strip()})
+    return out
+
+
+def _deepseek_reply(text: str, messages: list, actions: list, phone: str) -> str | None:
+    import httpx
+
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("Missing DEEPSEEK_API_KEY")
+    tools = [
+        {"type": "function", "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        }}
+        for t in TOOLS
+    ]
+    api_messages = [{"role": "system", "content": _system()}]
+    api_messages += _historial_texto(messages)
+    api_messages.append({"role": "user", "content": text})
+
+    for _ in range(MAX_STEPS):
+        response = httpx.post(
+            f"{DEEPSEEK_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": DEEPSEEK_MODEL,
+                "messages": api_messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "temperature": 0.3,
+                "max_tokens": 1200,
+                "stream": False,
+                "thinking": {"type": "disabled"},
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choice = (data.get("choices") or [{}])[0]
+        if choice.get("finish_reason") == "content_filter":
+            raise Refused()
+        message = choice.get("message") or {}
+        calls = message.get("tool_calls") or []
+        if not calls:
+            answer = (message.get("content") or "").strip()
+            messages.append({"role": "user", "content": text})
+            if answer:
+                messages.append({"role": "assistant", "content": answer})
+            return answer
+
+        api_messages.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": calls,
+        })
+        for call in calls:
+            function = call.get("function") or {}
+            name = function.get("name", "")
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            output, is_error = run_tool(name, args, phone)
+            actions.append({"tool": name, "input": args, "error": is_error})
+            api_messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id", ""),
+                "content": json.dumps(output, ensure_ascii=False),
+            })
+    return None
 
 # ---------- Gemini ----------
 
