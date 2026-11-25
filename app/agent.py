@@ -23,7 +23,7 @@ log = logging.getLogger("whatsapp-bot")
 
 PROVIDER = os.environ.get("PROVIDER", "claude").lower()
 MODEL = os.environ.get("MODEL", "claude-opus-5-5")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash")
 # If the primary Gemini model is overloaded or out of quota, try the fallback model
 GEMINI_MODELS = list(dict.fromkeys([m for m in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL) if m]))
